@@ -13,7 +13,7 @@ from tools import controlled_explore, solve_input
 # ============================================================
 # 配置
 # ============================================================
-BINARY_PATH = "./crackme"
+BINARY_PATH = "./crackmeNew.exe"
 
 # 关键地址（根据第三步的分析结果填入）
 # 示例地址，请替换为你的实际值
@@ -23,16 +23,16 @@ AVOID_ADDRS  = [0x401156]      # gadget_trap 函数入口地址
                                 # 也可以加上 call gadget_trap 的地址
 
 # LLM 配置
-LLM_BASE_URL = "https://api.openai.com/v1"  # OpenAI 兼容接口
-LLM_API_KEY  = "your-api-key-here"
-LLM_MODEL    = "gpt-4o"
+LLM_BASE_URL = "https://api.xiaomimimo.com/v1"   # 或 https://api.mimo-v2.com/v1
+LLM_API_KEY  = "sk-cwoz7cy5e7vrtclemqp8qephx47tb5a83d6ktf7uzseh7zcr"   # 在平台生成的 sk-xxxxxx
+LLM_MODEL    = "mimo-v2.5-pro" 
 
 MAX_ROUNDS = 10
 
 # ============================================================
 # 系统提示词
 # ============================================================
-SYSTEM_PROMPT = """你是一个二进制逆向分析助手。你的任务是分析一个 crackme 程序，找到能触发 "Success!" 输出的正确输入。
+SYSTEM_PROMPT = """你是一个二进制逆向分析助手。你的任务是分析一个 crackmeNew 程序，找到能触发 "Success!" 输出的正确输入。
 
 ## 目标程序信息
 该程序读取用户输入（最多9个字符），然后调用 check_password 函数进行验证。
