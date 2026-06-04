@@ -1,229 +1,201 @@
 """
-agent.py — ReAct 主循环
-实现 Thought → Action → Observation 闭环
+agent.py — ReAct 主循环（修复版）
 """
 
-import re
 import json
-import time
+import re
+import os
 from openai import OpenAI
-
 from tools import controlled_explore, solve_input
+import datetime
 
-# ============================================================
+# sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+# sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# ==============================================================
 # 配置
-# ============================================================
-BINARY_PATH = "./crackmeNew.exe"
+# ==============================================================
+BINARY_PATH  = "./crackme"
 
-# 关键地址（根据第三步的分析结果填入）
-# 示例地址，请替换为你的实际值
-SUCCESS_ADDR = [0x4011bc]      # printf("Success!") 之前的基本块地址
-                                # 或 call puts("Success!") 的地址
-AVOID_ADDRS  = [0x401156]      # gadget_trap 函数入口地址
-                                # 也可以加上 call gadget_trap 的地址
+SUCCESS_ADDR = [0x4011eb]    # puts("Success!") 前的基本块
+AVOID_ADDR   = [0x401156]    # gadget_trap 函数入口
 
-# LLM 配置
-LLM_BASE_URL = "https://api.xiaomimimo.com/v1"   # 或 https://api.mimo-v2.com/v1
-LLM_API_KEY  = "sk-cwoz7cy5e7vrtclemqp8qephx47tb5a83d6ktf7uzseh7zcr"   # 在平台生成的 sk-xxxxxx
-LLM_MODEL    = "mimo-v2.5-pro" 
+# LLM 配置 —— 按你的环境修改
+# LLM 配置 —— MiMo API
+LLM_BASE_URL = "https://api.xiaomimimo.com/v1"
+LLM_API_KEY  = "sk-**************************"
+LLM_MODEL    = "mimo-v2.5-pro"
 
-MAX_ROUNDS = 10
 
-# ============================================================
-# 系统提示词
-# ============================================================
-SYSTEM_PROMPT = """你是一个二进制逆向分析助手。你的任务是分析一个 crackmeNew 程序，找到能触发 "Success!" 输出的正确输入。
+MAX_ROUNDS   = 10
+# 改为：用时间戳避免文件冲突
+LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(LOG_DIR, f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
-## 目标程序信息
-该程序读取用户输入（最多9个字符），然后调用 check_password 函数进行验证。
-程序存在以下路径：
-1. 如果第一个字符是 'A'，第二个字符是 'B' → 进入 gadget_trap() 死循环（必须避免）
-2. 如果第一个字符是 'A'，第二个字符是 'Z' → 输出 "Success! Flag is found."（目标）
-3. 其他情况 → 输出 "Wrong password!"
+
+# ==============================================================
+# 系统提示词（优化版）
+# ==============================================================
+SYSTEM_PROMPT = """你是一个二进制逆向分析 Agent。你的任务是找到 crackme 程序的正确输入。
+
+## 规则
+1. 每轮必须且只能调用一个工具
+2. 不要自行猜测答案，必须通过工具求解
+3. 不要输出 "Action: none" 或 "Action: report"，只使用下面列出的两个工具
+4. 当 Observation 显示 success: true 时，任务完成
 
 ## 可用工具
-你可以使用以下两个工具（请严格按格式调用）：
+- controlled_explore：探索程序路径，返回路径统计
+- solve_input：从成功路径状态中求解具体输入值
 
-### 工具1: controlled_explore
-- 作用：在指定约束下探索程序路径
-- 格式：Action: controlled_explore()
-- 说明：使用预配置的 find/avoid 地址进行探索，返回路径统计信息
+## 输出格式（严格遵守）
+Thought: <你的推理>
+Action: <controlled_explore 或 solve_input>
 
-### 工具2: solve_input
-- 作用：从目标状态求解具体输入
-- 格式：Action: solve_input()
-- 说明：使用预配置的 find/avoid 地址探索并求解输入
+## 分析策略（严格按顺序执行 3 步）
 
-## 交互协议
-每一轮请按以下格式回复：
+### 第 1 步：初步探索
+使用 controlled_explore 探索程序，观察路径统计（found/avoided/deadended 数量），
+判断是否存在到达目标的路径。
 
-Thought: <你的推理过程，分析当前状态，决定下一步>
-Action: <工具名>
+### 第 2 步：路径分析与验证
+根据第 1 步的结果，分析程序的分支结构。思考：
+- 有多少条路径被 deadend？
+- avoid 的路径意味着什么？
+- 目标路径是否确认可达？
+在 Thought 中写出你的分析结论，然后调用 controlled_explore 再次确认。
 
-重要提示：
-- 每轮只调用一个工具
-- 仔细分析 Observation 结果后再决定下一步
-- 如果已经得到具体输入，可以直接报告结果
-- 不需要为工具传递地址参数，系统会自动使用预配置的地址"""
+### 第 3 步：求解输入
+前两步已确认路径可达，现在调用 solve_input 从成功状态中求解具体的输入值。
 
-# ============================================================
+重要：你必须完成以上 3 步，每步一轮，总共至少 3 轮。
+"""
+
+
+# ==============================================================
 # LLM 调用
-# ============================================================
+# ==============================================================
 client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
+
 def call_llm(messages):
-    """调用 LLM 获取回复"""
-    response = client.chat.completions.create(
+    resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=messages,
-        temperature=0.1,      # 低温度保证稳定性
-        max_tokens=1000
+        temperature=0.1,
+        max_tokens=600,
     )
-    return response.choices[0].message.content
+    return resp.choices[0].message.content
 
 
-# ============================================================
+# ==============================================================
 # 解析 LLM 输出
-# ============================================================
-def parse_llm_output(text):
-    """
-    从 LLM 输出中提取 Thought 和 Action
-    """
-    # 提取 Thought
-    thought_match = re.search(
-        r"Thought:\s*(.+?)(?=\nAction:|\Z)",
-        text,
-        re.DOTALL
-    )
-    thought = thought_match.group(1).strip() if thought_match else text
-
-    # 提取 Action
-    action_match = re.search(r"Action:\s*(\w+)", text)
-    action = action_match.group(1).strip() if action_match else "none"
-
+# ==============================================================
+def parse_output(text):
+    thought_m = re.search(r"Thought:\s*(.+?)(?=\nAction:|\Z)", text, re.DOTALL)
+    action_m  = re.search(r"Action:\s*(\w+)", text)
     return {
-        "thought": thought,
-        "action": action,
-        "raw": text
+        "thought": thought_m.group(1).strip() if thought_m else text.strip(),
+        "action":  action_m.group(1).strip()  if action_m  else "none",
+        "raw":     text,
     }
 
 
-# ============================================================
-# 执行工具
-# ============================================================
-def execute_tool(action_name):
-    """
-    根据解析出的 Action 名称调用对应的 angr 工具
-    """
-    if action_name == "controlled_explore":
-        result = controlled_explore(
-            BINARY_PATH,
-            find_addrs=SUCCESS_ADDR,
-            avoid_addrs=AVOID_ADDRS,
-            max_steps=100
-        )
-        return result
-
-    elif action_name == "solve_input":
-        result = solve_input(
-            BINARY_PATH,
-            find_addrs=SUCCESS_ADDR,
-            avoid_addrs=AVOID_ADDRS,
-            max_steps=100
-        )
-        return result
-
-    else:
-        return {"error": f"未识别的工具: {action_name}"}
+# ==============================================================
+# 工具派发
+# ==============================================================
+TOOL_MAP = {
+    "controlled_explore": controlled_explore,
+    "solve_input": solve_input,
+}
 
 
-# ============================================================
-# 格式化 Observation
-# ============================================================
-def format_observation(tool_result):
-    """将工具结果格式化为结构化文本，供 LLM 阅读"""
-    return json.dumps(tool_result, indent=2, ensure_ascii=False)
+def dispatch(action):
+    fn = TOOL_MAP.get(action)
+    if fn is None:
+        return {"error": f"未知工具: {action}。请使用 controlled_explore 或 solve_input"}
+    return fn(BINARY_PATH, find_addrs=SUCCESS_ADDR, avoid_addrs=AVOID_ADDR)
 
 
-# ============================================================
-# ReAct 主循环
-# ============================================================
+# ==============================================================
+# 主循环
+# ==============================================================
 def main():
     print("=" * 60)
-    print("ReAct Agent for crackme 分析")
+    print("ReAct Agent — crackme 自动化逆向分析")
     print("=" * 60)
-    print(f"目标程序: {BINARY_PATH}")
-    print(f"find 地址: {[hex(a) for a in SUCCESS_ADDR]}")
-    print(f"avoid 地址: {[hex(a) for a in AVOID_ADDRS]}")
+    print(f"Binary  : {BINARY_PATH}")
+    print(f"Find    : {[hex(a) for a in SUCCESS_ADDR]}")
+    print(f"Avoid   : {[hex(a) for a in AVOID_ADDR]}")
+    print(f"LLM     : {LLM_MODEL}")
+    print(f"Log     : {LOG_PATH}")
     print("=" * 60)
 
-    # 初始化对话历史
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "请开始分析程序，找到正确的输入。"}
+        {"role": "user",   "content": "请开始分析 crackme 程序，找到正确输入。"},
     ]
 
-    # 运行日志
     log = []
 
-    for round_num in range(1, MAX_ROUNDS + 1):
-        print(f"\n{'='*60}")
-        print(f"Round {round_num}")
-        print(f"{'='*60}")
+    for rnd in range(1, MAX_ROUNDS + 1):
+        print(f"\n{'─' * 60}")
+        print(f"Round {rnd}")
+        print(f"{'─' * 60}")
 
-        # ① 调用 LLM 获取 Thought + Action
-        llm_output = call_llm(messages)
-        parsed = parse_llm_output(llm_output)
+        # 1) LLM 思考
+        llm_text = call_llm(messages)
+        parsed   = parse_output(llm_text)
+        print(f"\n[Thought] {parsed['thought']}")
+        print(f"[Action]  {parsed['action']}")
 
-        print(f"\n[Thought]\n{parsed['thought']}")
-        print(f"\n[Action]\n{parsed['action']}")
+        # 2) 如果 LLM 输出了无效工具，提示它重试
+        if parsed["action"] not in TOOL_MAP:
+            observation = {
+                "error": f"无效工具 '{parsed['action']}'。"
+                         f"你只能使用 controlled_explore 或 solve_input。"
+                         f"请在下一轮严格按格式调用其中一个。"
+            }
+        else:
+            # 3) 执行工具
+            observation = dispatch(parsed["action"])
 
-        # ② 执行工具
-        tool_result = execute_tool(parsed["action"])
-        observation_text = format_observation(tool_result)
+        obs_text = json.dumps(observation, indent=2, ensure_ascii=False)
+        print(f"\n[Observation]\n{obs_text}")
 
-        print(f"\n[Observation]\n{observation_text}")
-
-        # ③ 记录日志
+        # 4) 记录日志
         log.append({
-            "round": round_num,
+            "round": rnd,
             "thought": parsed["thought"],
             "action": parsed["action"],
-            "observation": tool_result
+            "observation": observation,
         })
 
-        # ④ 将对话延续
-        messages.append({"role": "assistant", "content": llm_output})
-        messages.append({
-            "role": "user",
-            "content": f"Observation:\n{observation_text}"
-        })
+        # 5) 延续对话
+        messages.append({"role": "assistant", "content": llm_text})
+        messages.append({"role": "user",      "content": f"Observation:\n{obs_text}"})
 
-        # ⑤ 检查是否完成
-        if tool_result.get("success") and tool_result.get("input_ascii"):
-            found_input = tool_result["input_ascii"]
-            print(f"\n{'='*60}")
-            print(f"✓ 找到正确输入: {found_input}")
-            print(f"{'='*60}")
+        # 6) 终止判断：工具已成功求解输入
+        if observation.get("success") and observation.get("input_ascii"):
+            ans = observation["input_ascii"]
+            print(f"\n{'=' * 60}")
+            print(f"[OK] 求解成功！正确输入: {ans}")
+            print(f"{'=' * 60}")
 
             # 让 LLM 做最终总结
             messages.append({
                 "role": "user",
-                "content": f"已经求解成功，输入为 '{found_input}'。请做最终总结。"
+                "content": f"已求解成功，输入为 '{ans}'。请做最终总结。",
             })
-            final_output = call_llm(messages)
-            print(f"\n[最终总结]\n{final_output}")
-            log.append({"round": "final", "summary": final_output})
+            summary = call_llm(messages)
+            print(f"\n[总结]{summary}")
+            log.append({"round": "final", "summary": summary})
             break
 
-        # 如果 LLM 声称已完成但工具未确认
-        if parsed["action"] == "none" or "完成" in parsed["thought"]:
-            print("\n[Agent 声称任务完成，但未通过工具验证]")
-
     # 保存日志
-    with open("run.log", "w", encoding="utf-8") as f:
+    with open(LOG_PATH, "w", encoding="utf-8") as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
-    print("\n运行日志已保存到 run.log")
+    print(f"\n运行日志已保存 → {LOG_PATH}")
 
 
 if __name__ == "__main__":

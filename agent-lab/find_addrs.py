@@ -73,4 +73,4 @@ def find_addrs(binary_path):
         print(f"avoid 地址 (调用 gadget_trap 的块): {hex(trap_call_addr)}")
 
 if __name__ == "__main__":
-    find_addrs("./crackmeNew")
+    find_addrs("./crackme")
