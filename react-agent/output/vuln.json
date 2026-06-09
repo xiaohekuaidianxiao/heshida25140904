@@ -1,0 +1,5 @@
+{
+  "vuln_type": "not_found",
+  "location": "unknown",
+  "cause": "Maximum iterations reached"
+}
