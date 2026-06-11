@@ -1,5 +1,5 @@
 {
-  "vuln_type": "not_found",
-  "location": "unknown",
-  "cause": "Maximum iterations reached"
+  "vuln_type": "stack buffer overflow",
+  "location": "main (0x00401264)",
+  "cause": "函数通过fgets读取用户输入到栈缓冲区s1（位于rsp+0x20，大小0x80字节）。随后进行边界检查：计算输入字符串长度（strlen）并减去1，然后与99比较，若长度<=100则允许复制。然而，复制操作使用__strcpy_chk将源缓冲区s1（最大可含100字节）复制到目标缓冲区（位于rsp，大小仅为0x10字节）。由于检查未考虑目标缓冲区大小，允许远超目标容量的数据被复制，导致栈缓冲区溢出。"
 }

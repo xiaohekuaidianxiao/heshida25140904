@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+ReAct Agent for Static Binary Analysis
+改进版：VulnScan 预扫描 + 证据链约束 + 增强错误处理
+"""
+
 import os
 import sys
 import json
@@ -10,22 +16,22 @@ from typing import Dict, List, Any, Optional
 from openai import OpenAI
 
 # ==================== 配置区域 ====================
-API_KEY = "sk-cwoz7cy5e7vrtclemqp8qephx47tb5a83d6ktf7uzseh7zcr"
+API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 BASE_URL = "https://api.xiaomimimo.com/v1"
 MODEL_NAME = "xiaomi/mimo-v2.5-pro"
 
-GHIDRA_HOME = "/usr/share/ghidra"
+GHIDRA_HOME = os.environ.get("GHIDRA_INSTALL_DIR", "/usr/share/ghidra")
 GHIDRA_HEADLESS = os.path.join(GHIDRA_HOME, "support", "analyzeHeadless")
 
 TARGET_FILE = "./targets/challenge"
 LOG_FILE = "./logs/run.txt"
 OUTPUT_FILE = "./output/vuln.json"
 
-# Ghidra Python 脚本存放目录（永久路径，只写一次）
-GHIDRA_SCRIPTS_DIR = "/tmp/ghidra_agent_scripts"
+# Java 脚本存放目录
+GHIDRA_SCRIPTS_DIR = "/tmp/ghidra_agent_java_scripts"
 
 
-# ==================== Radare2 工具（无变化） ====================
+# ==================== Radare2 工具 ====================
 class Radare2Tool:
     """radare2 工具封装"""
 
@@ -78,325 +84,659 @@ class Radare2Tool:
         return self._run_r2_command(binary_path, [f"axt @ {address}"])
 
 
-# ==================== Ghidra 工具（重写版） ====================
+# ==================== Ghidra 工具 ====================
 class GhidraTool:
     """
-    Ghidra 工具封装 — 使用 subprocess 隔离方案。
-    
-    每次工具调用都在独立子进程中完成（纯 ASCII 环境），
-    彻底避免 pyghidra 在主进程中因 sys.path 含非 ASCII 字符而崩溃。
+    Ghidra 工具封装 — 使用 analyzeHeadless + Java (.java) 脚本方案。
     """
 
     def __init__(self):
         self._check_ghidra()
-        self._check_python()
-        print("[*] Ghidra tool initialized (subprocess isolation).")
+        self._write_scripts()
+        print("[*] Ghidra tool initialized (analyzeHeadless + 4 Java scripts).")
 
     def _check_ghidra(self):
         if not os.path.isfile(GHIDRA_HEADLESS):
-            raise RuntimeError(f"analyzeHeadless not found at {GHIDRA_HEADLESS}")
+            raise RuntimeError(f"analyzeHeadless not found: {GHIDRA_HEADLESS}")
+        if not os.access(GHIDRA_HEADLESS, os.X_OK):
+            raise RuntimeError(f"analyzeHeadless not executable: {GHIDRA_HEADLESS}")
         print(f"[ghidra] analyzeHeadless: {GHIDRA_HEADLESS}")
 
-    def _check_python(self):
-        """确认当前 Python 可执行文件路径是纯 ASCII。"""
-        try:
-            sys.executable.encode('ascii')
-            print(f"[ghidra] Python: {sys.executable}")
-        except UnicodeEncodeError:
-            raise RuntimeError(
-                f"Python executable path contains non-ASCII: {sys.executable}\n"
-                f"Please use a Python from a pure ASCII path."
-            )
+    def _write_scripts(self):
+        """一次性写入四个 Java 分析脚本到 GHIDRA_SCRIPTS_DIR。"""
+        os.makedirs(GHIDRA_SCRIPTS_DIR, exist_ok=True)
+
+        # ---- 反编译脚本 ----
+        decompile_java = r"""
+import ghidra.app.script.GhidraScript;
+import ghidra.app.decompiler.*;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.*;
+import ghidra.util.task.ConsoleTaskMonitor;
+
+public class DecompileFunc extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        try {
+            println("SCRIPT_START: DecompileFunc");
+            String[] args = getScriptArgs();
+            if (args == null || args.length < 1) {
+                println("ERROR: Need function name as argument");
+                return;
+            }
+            String funcName = args[0];
+            println("Looking up function: " + funcName);
+
+            Listing listing = currentProgram.getListing();
+            Function func = listing.getFunction(funcName);
+
+            // If not found by name, try symbol table search
+            if (func == null) {
+                println("Not found by listing name, trying symbol table...");
+                SymbolTable st = currentProgram.getSymbolTable();
+                SymbolIterator si = st.getSymbols(funcName);
+                while (si.hasNext()) {
+                    Symbol sym = si.next();
+                    if (sym.isFunction()) {
+                        func = listing.getFunctionAt(sym.getAddress());
+                        if (func != null) {
+                            println("Found via symbol: " + func.getName() + " @ " + func.getEntryPoint());
+                            break;
+                        }
+                    }
+                }
+            } else {
+                println("Found function: " + func.getName() + " @ " + func.getEntryPoint());
+            }
+
+            if (func == null) {
+                // List available functions to help debug
+                println("ERROR: Function '" + funcName + "' not found.");
+                println("Available user-defined functions:");
+                FunctionIterator fi = currentProgram.getFunctionManager().getFunctions(true);
+                int count = 0;
+                while (fi.hasNext() && count < 30) {
+                    Function f = fi.next();
+                    if (!f.isExternal()) {
+                        println("  " + f.getEntryPoint() + " " + f.getName());
+                        count++;
+                    }
+                }
+                return;
+            }
+
+            println("Decompiling...");
+            DecompInterface dc = new DecompInterface();
+            dc.openProgram(currentProgram);
+            DecompileResults dr = dc.decompileFunction(func, 60, new ConsoleTaskMonitor());
+            if (dr != null && dr.decompileCompleted()) {
+                println("DECOMPILED_CODE_START");
+                println(dr.getDecompiledFunction().getC());
+                println("DECOMPILED_CODE_END");
+            } else {
+                String err = (dr != null) ? dr.getErrorMessage() : "unknown";
+                println("ERROR: Decompilation failed: " + err);
+            }
+            dc.dispose();
+        } catch (Exception e) {
+            println("EXCEPTION: " + e.getClass().getName() + ": " + e.getMessage());
+        }
+    }
+}
+"""
+
+        # ---- 调用关系脚本 ----
+        calls_java = r"""
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.*;
+import java.util.*;
+
+public class FuncCalls extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        try {
+            println("SCRIPT_START: FuncCalls");
+            String[] args = getScriptArgs();
+            if (args == null || args.length < 1) {
+                println("ERROR: Need function name as argument");
+                return;
+            }
+            String funcName = args[0];
+            println("Looking up function: " + funcName);
+
+            Listing listing = currentProgram.getListing();
+            Function func = listing.getFunction(funcName);
+
+            if (func == null) {
+                SymbolTable st = currentProgram.getSymbolTable();
+                SymbolIterator si = st.getSymbols(funcName);
+                while (si.hasNext()) {
+                    Symbol sym = si.next();
+                    if (sym.isFunction()) {
+                        func = listing.getFunctionAt(sym.getAddress());
+                        if (func != null) break;
+                    }
+                }
+            }
+
+            if (func == null) {
+                println("ERROR: Function '" + funcName + "' not found.");
+                println("Available user-defined functions:");
+                FunctionIterator fi = currentProgram.getFunctionManager().getFunctions(true);
+                int count = 0;
+                while (fi.hasNext() && count < 30) {
+                    Function f = fi.next();
+                    if (!f.isExternal()) {
+                        println("  " + f.getEntryPoint() + " " + f.getName());
+                        count++;
+                    }
+                }
+                return;
+            }
+
+            println("Analyzing calls in: " + func.getName() + " @ " + func.getEntryPoint());
+            Set<String> calls = new TreeSet<>();
+            InstructionIterator it = listing.getInstructions(func.getBody(), true);
+            while (it.hasNext()) {
+                Instruction ins = it.next();
+                String m = ins.getMnemonicString().toLowerCase();
+                if (m.equals("call") || m.equals("callq") || m.equals("jmp")) {
+                    for (Reference ref : ins.getReferencesFrom()) {
+                        Function cf = listing.getFunctionContaining(ref.getToAddress());
+                        if (cf != null) calls.add(cf.getName());
+                    }
+                }
+            }
+            if (calls.isEmpty()) {
+                println("No calls found.");
+            } else {
+                println("Called functions: " + String.join(", ", calls));
+            }
+        } catch (Exception e) {
+            println("EXCEPTION: " + e.getClass().getName() + ": " + e.getMessage());
+        }
+    }
+}
+"""
+
+        # ---- 交叉引用脚本 ----
+        xrefs_java = r"""
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.*;
+import java.util.*;
+
+public class FuncXrefs extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        try {
+            println("SCRIPT_START: FuncXrefs");
+            String[] args = getScriptArgs();
+            if (args == null || args.length < 1) {
+                println("ERROR: Need function name as argument");
+                return;
+            }
+            String funcName = args[0];
+            println("Looking up function: " + funcName);
+
+            Listing listing = currentProgram.getListing();
+            Function func = listing.getFunction(funcName);
+
+            if (func == null) {
+                SymbolTable st = currentProgram.getSymbolTable();
+                SymbolIterator si = st.getSymbols(funcName);
+                while (si.hasNext()) {
+                    Symbol sym = si.next();
+                    if (sym.isFunction()) {
+                        func = listing.getFunctionAt(sym.getAddress());
+                        if (func != null) break;
+                    }
+                }
+            }
+
+            if (func == null) {
+                println("ERROR: Function '" + funcName + "' not found.");
+                println("Available user-defined functions:");
+                FunctionIterator fi = currentProgram.getFunctionManager().getFunctions(true);
+                int count = 0;
+                while (fi.hasNext() && count < 30) {
+                    Function f = fi.next();
+                    if (!f.isExternal()) {
+                        println("  " + f.getEntryPoint() + " " + f.getName());
+                        count++;
+                    }
+                }
+                return;
+            }
+
+            println("Analyzing xrefs to: " + func.getName() + " @ " + func.getEntryPoint());
+            Set<String> callers = new TreeSet<>();
+            Reference[] refs = currentProgram.getReferenceManager().getReferencesTo(func.getEntryPoint());
+            for (Reference ref : refs) {
+                Function caller = listing.getFunctionContaining(ref.getFromAddress());
+                if (caller != null) callers.add(caller.getName());
+            }
+            if (callers.isEmpty()) {
+                println("No cross references found.");
+            } else {
+                println("Called by: " + String.join(", ", callers));
+            }
+        } catch (Exception e) {
+            println("EXCEPTION: " + e.getClass().getName() + ": " + e.getMessage());
+        }
+    }
+}
+"""
+
+        # ---- 漏洞模式扫描脚本 ----
+        vuln_scan_java = r"""
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.*;
+import ghidra.program.model.symbol.*;
+import ghidra.program.model.address.Address;
+import java.util.*;
+
+public class VulnScan extends GhidraScript {
+
+    private static final String[] SINKS = {
+        "gets", "fgets", "strcpy", "strncpy", "strcat", "strncat",
+        "sprintf", "snprintf", "__strcpy_chk", "__strcat_chk",
+        "__sprintf_chk", "__snprintf_chk",
+        "scanf", "sscanf", "fscanf",
+        "system", "popen", "execl", "execlp", "execle",
+        "execv", "execvp", "execvpe",
+        "memcpy", "memmove", "memset",
+        "read", "recv", "recvfrom"
+    };
+
+    private static final String[] SOURCE_SINKS = {
+        "gets", "fgets", "scanf", "sscanf", "fscanf",
+        "read", "recv", "recvfrom"
+    };
+
+    @Override
+    public void run() throws Exception {
+        println("=== VulnScan: Dangerous Function Call Scan ===");
+        println("Program: " + currentProgram.getName());
+        println("Image base: " + currentProgram.getImageBase());
+        println("NOTE: Binary is stripped. Ghidra auto-names functions as ENTRYADDR.");
+        println("Use these names when calling ghidra_decompile_function or ghidra_get_function_calls.");
+        println("");
+
+        Listing listing = currentProgram.getListing();
+        FunctionManager fm = currentProgram.getFunctionManager();
+
+        Map<String, List<String[]>> findings = new LinkedHashMap<>();
+
+        FunctionIterator funcs = fm.getFunctions(true);
+        while (funcs.hasNext()) {
+            Function func = funcs.next();
+            InstructionIterator insts = listing.getInstructions(func.getBody(), true);
+            while (insts.hasNext()) {
+                Instruction ins = insts.next();
+                String m = ins.getMnemonicString().toLowerCase();
+                if (!m.equals("call") && !m.equals("callq") && !m.equals("jmp")) {
+                    continue;
+                }
+
+                Reference[] refs = ins.getReferencesFrom();
+                for (Reference ref : refs) {
+                    Function tf = listing.getFunctionContaining(ref.getToAddress());
+                    if (tf == null) continue;
+                    String tn = tf.getName();
+
+                    String matched = null;
+                    for (String s : SINKS) {
+                        if (tn.contains(s)) {
+                            matched = s;
+                            break;
+                        }
+                    }
+                    if (matched == null) continue;
+
+                    boolean isSrc = false;
+                    for (String s : SOURCE_SINKS) {
+                        if (tn.contains(s)) {
+                            isSrc = true;
+                            break;
+                        }
+                    }
+                    String tag = isSrc ? "INPUT" : "SINK";
+
+                    findings.computeIfAbsent(func.getName(), k -> new ArrayList<>())
+                        .add(new String[]{
+                            ins.getAddress().toString(),
+                            tn,
+                            tag
+                        });
+                }
+            }
+        }
+
+        if (findings.isEmpty()) {
+            println("No dangerous function calls found.");
+            println("=== End VulnScan ===");
+            return;
+        }
+
+        int totalFindings = 0;
+        for (List<String[]> v : findings.values()) totalFindings += v.size();
+        println("Found " + findings.size() + " functions with " + totalFindings + " dangerous calls:");
+        println("");
+
+        for (Map.Entry<String, List<String[]>> entry : findings.entrySet()) {
+            String funcName = entry.getKey();
+            List<String[]> calls = entry.getValue();
+
+            Function func = null;
+            FunctionIterator fi = fm.getFunctions(true);
+            while (fi.hasNext()) {
+                Function f = fi.next();
+                if (f.getName().equals(funcName)) {
+                    func = f;
+                    break;
+                }
+            }
+            if (func == null) continue;
+
+            println("--- Function: " + funcName + " @ " + func.getEntryPoint() + " ---");
+            println("  Dangerous calls: " + calls.size());
+            for (String[] c : calls) {
+                println("    [" + c[2] + "] " + c[1] + " called at " + c[0]);
+            }
+
+            List<Instruction> allInsts = new ArrayList<>();
+            InstructionIterator iter = listing.getInstructions(func.getBody(), true);
+            while (iter.hasNext()) {
+                allInsts.add(iter.next());
+            }
+
+            Set<Integer> dangerIdx = new TreeSet<>();
+            for (int i = 0; i < allInsts.size(); i++) {
+                String addr = allInsts.get(i).getAddress().toString();
+                for (String[] c : calls) {
+                    if (addr.equals(c[0])) {
+                        dangerIdx.add(i);
+                        break;
+                    }
+                }
+            }
+
+            if (!dangerIdx.isEmpty()) {
+                int minIdx = Collections.min(dangerIdx);
+                int maxIdx = Collections.max(dangerIdx);
+                int start = Math.max(0, minIdx - 8);
+                int end = Math.min(allInsts.size() - 1, maxIdx + 8);
+
+                println("  Instruction context (" + allInsts.size() + " total instructions):");
+                for (int i = start; i <= end; i++) {
+                    Instruction ins = allInsts.get(i);
+                    String marker = dangerIdx.contains(i) ? " >>> " : "     ";
+                    println("    " + marker + ins.getAddress() + " " + ins.toString());
+                }
+            }
+            println("");
+        }
+        println("=== End VulnScan ===");
+    }
+}
+"""
+
+        scripts = {
+            "DecompileFunc.java": decompile_java,
+            "FuncCalls.java": calls_java,
+            "FuncXrefs.java": xrefs_java,
+            "VulnScan.java": vuln_scan_java,
+        }
+
+        for name, content in scripts.items():
+            path = os.path.join(GHIDRA_SCRIPTS_DIR, name)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content.strip() + "\n")
+            if not os.path.isfile(path):
+                raise RuntimeError(f"Failed to write script: {path}")
+
+        print(f"[ghidra] 4 Java scripts written to {GHIDRA_SCRIPTS_DIR}")
 
     def _prepare_binary(self, binary_path: str) -> str:
-        """将二进制文件复制到 /tmp 下的纯 ASCII 路径。"""
+        """确保目标文件路径为纯 ASCII。"""
         abs_path = os.path.abspath(binary_path)
         try:
             abs_path.encode('ascii')
             return abs_path
         except UnicodeEncodeError:
-            pass
-        tmp_dir = tempfile.mkdtemp(prefix="ghidra_bin_")
-        tmp_path = os.path.join(tmp_dir, os.path.basename(binary_path))
-        shutil.copy2(abs_path, tmp_path)
-        os.chmod(tmp_path, 0o755)
-        print(f"[ghidra] Copied to ASCII-safe path: {tmp_path}")
-        return tmp_path
+            tmp_dir = tempfile.mkdtemp(prefix="ghidra_bin_")
+            tmp_path = os.path.join(tmp_dir, os.path.basename(binary_path))
+            shutil.copy2(abs_path, tmp_path)
+            os.chmod(tmp_path, 0o755)
+            print(f"[ghidra] Copied to ASCII path: {tmp_path}")
+            return tmp_path
 
-    def _run_in_subprocess(self, binary_path: str, command: str, func_name: str = "") -> str:
+    def _run_script(self, binary_path: str, script_name: str, *script_args) -> str:
         """
-        在干净子进程中执行 Ghidra 分析。
-        子进程使用纯 ASCII 环境，彻底隔离 sys.path 污染。
+        通过 analyzeHeadless -postScript 执行 Java 脚本。
+        返回脚本 stdout 中的有用输出，失败时返回诊断信息。
         """
         safe_binary = self._prepare_binary(binary_path)
+        proj_dir = tempfile.mkdtemp(prefix="ghidra_proj_")
 
-        # ---- 构建子进程脚本 ----
-        worker_script = r'''
-import os, sys, tempfile, shutil
+        cmd = [
+            GHIDRA_HEADLESS,
+            proj_dir,
+            "analysis_project",
+            "-import", safe_binary,
+            "-postScript", script_name,
+        ]
+        cmd.extend(script_args)
+        cmd.extend(["-scriptPath", GHIDRA_SCRIPTS_DIR])
+        cmd.append("-deleteProject")
 
-# ===== 1. 强制干净环境 =====
-os.environ["GHIDRA_INSTALL_DIR"] = "/usr/share/ghidra"
-os.chdir("/tmp")
-
-# ===== 2. 清理 sys.path 中所有非 ASCII 路径 =====
-clean = []
-for p in sys.path:
-    try:
-        p.encode('ascii')
-        clean.append(p)
-    except UnicodeEncodeError:
-        pass
-sys.path = clean
-
-# ===== 3. 启动 pyghidra =====
-import pyghidra
-pyghidra.start()
-
-from ghidra.framework.project import DefaultProjectManager
-from ghidra.app.util.importer import AutoImporter
-from ghidra.program.flatapi import FlatProgramAPI
-from ghidra.util.task import ConsoleTaskMonitor
-from java.io import File as JavaFile
-from ghidra.app.decompiler import DecompInterface
-
-binary_path = sys.argv[1]
-command     = sys.argv[2]
-func_name   = sys.argv[3] if len(sys.argv) > 3 else ""
-
-temp_dir = tempfile.mkdtemp(prefix="ghidra_work_")
-try:
-    # 创建项目、导入、分析
-    project_mgr = DefaultProjectManager()
-    project = project_mgr.createProject(temp_dir, "proj", True)
-    domain_folder = project.getRootFolder()
-
-    java_file = JavaFile(binary_path)
-    monitor = ConsoleTaskMonitor()
-    domain_file = AutoImporter.importByUsingBestGuess(java_file, domain_folder, None, monitor)
-    if domain_file is None:
-        print("ERROR: AutoImporter failed")
-        sys.exit(1)
-
-    program = domain_file.getDomainObject("analysis", True, False, monitor)
-    flat_api = FlatProgramAPI(program)
-    flat_api.analyzeAll(program)
-
-    listing = program.getListing()
-
-    # 查找函数
-    func = listing.getFunction(func_name)
-    if func is None:
-        sym_table = program.getSymbolTable()
-        for sym in sym_table.getSymbols(func_name):
-            if sym.isFunction():
-                func = listing.getFunctionAt(sym.getAddress())
-                if func is not None:
-                    break
-
-    if func is None:
-        print("ERROR: Function '" + func_name + "' not found.")
-    elif command == "decompile":
-        decompiler = DecompInterface()
-        decompiler.openProgram(program)
-        results = decompiler.decompileFunction(func, 60, monitor)
-        if results is not None and results.decompileCompleted():
-            code = results.getDecompiledFunction().getC()
-            print("DECOMPILED_CODE_START")
-            print(code)
-            print("DECOMPILED_CODE_END")
-        else:
-            err = results.getErrorMessage() if results is not None else "unknown"
-            print("ERROR: Decompilation failed: " + err)
-        decompiler.dispose()
-    elif command == "calls":
-        calls = set()
-        for ins in listing.getInstructions(func.getBody(), True):
-            m = ins.getMnemonicString().lower()
-            if m in ("call", "callq", "jmp"):
-                for ref in ins.getReferencesFrom():
-                    cf = listing.getFunctionContaining(ref.getToAddress())
-                    if cf:
-                        calls.add(cf.getName())
-        if calls:
-            print("Called functions: " + ", ".join(sorted(calls)))
-        else:
-            print("No calls found.")
-    elif command == "xrefs":
-        callers = set()
-        for ref in program.getReferenceManager().getReferencesTo(func.getEntryPoint()):
-            c = listing.getFunctionContaining(ref.getFromAddress())
-            if c:
-                callers.add(c.getName())
-        if callers:
-            print("Called by: " + ", ".join(sorted(callers)))
-        else:
-            print("No cross references found.")
-
-    program.release(None)
-    project.close()
-finally:
-    shutil.rmtree(temp_dir, ignore_errors=True)
-'''
-
-        # 写入 /tmp
-        script_path = '/tmp/_ghidra_worker.py'
-        with open(script_path, 'w', encoding='ascii') as f:
-            f.write(worker_script)
-
-        # ---- 构建纯 ASCII 环境变量 ----
-        clean_env = {
-            'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-            'HOME': os.environ.get('HOME', '/root'),
-            'GHIDRA_INSTALL_DIR': '/usr/share/ghidra',
-            'LANG': 'C.UTF-8',
-            'LC_ALL': 'C.UTF-8',
-        }
-
-        # 确保 HOME 是 ASCII
-        try:
-            clean_env['HOME'].encode('ascii')
-        except UnicodeEncodeError:
-            clean_env['HOME'] = '/root'
-
-        # 如果 PYTHONPATH 有必要，只添加纯 ASCII 路径
-        # （通常不需要，Python 会自动找到标准库和 site-packages）
-        venv_base = os.path.dirname(os.path.dirname(sys.executable))
-        venv_lib = os.path.join(
-            venv_base, 'lib',
-            f'python{sys.version_info.major}.{sys.version_info.minor}',
-            'site-packages'
-        )
-        try:
-            venv_lib.encode('ascii')
-            clean_env['PYTHONPATH'] = venv_lib
-        except UnicodeEncodeError:
-            # 如果 venv 路径含非 ASCII，不设置 PYTHONPATH
-            # 子进程会用系统 Python（需要确认 pyghidra 在系统 Python 中也可用）
-            pass
-
-        print(f"[ghidra] Running: {command}({func_name})")
+        print(f"[ghidra] Running: {script_name} {' '.join(script_args)}")
 
         try:
             result = subprocess.run(
-                [sys.executable, script_path, safe_binary, command, func_name],
+                cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
-                cwd='/tmp',
-                env=clean_env,
+                timeout=180,
+                env={**os.environ, "GHIDRA_INSTALL_DIR": GHIDRA_HOME},
             )
 
-            # 清理脚本
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
 
-            stdout = result.stdout
-            stderr = result.stderr
+            # ---- 第一步：提取脚本 println 输出 ----
+            useful_lines = []
+            for line in stdout.split('\n'):
+                if '.java>' in line:
+                    idx = line.index('>')
+                    content = line[idx + 1:].strip()
+                    if content.endswith('(GhidraScript)'):
+                        content = content[:-len('(GhidraScript)')].strip()
+                    if content:
+                        useful_lines.append(content)
 
-            if result.returncode != 0:
-                stderr_tail = stderr[-800:] if stderr else "no stderr"
-                print(f"[ghidra] STDERR:\n{stderr_tail}")
-                return f"Ghidra error (rc={result.returncode}): {stderr_tail[-500:]}"
+            output = '\n'.join(useful_lines)
+            if output:
+                return output
 
-            return stdout if stdout.strip() else "No output from Ghidra."
+            # ---- 第二步：无脚本输出，收集诊断信息 ----
+            diagnostic = []
+
+            # 检查 stdout 中的错误/警告行
+            error_keywords = [
+                'ERROR', 'error', 'SCRIPT', 'script', 'compile', 'Compile',
+                'Exception', 'exception', 'failed', 'Failed', 'not found',
+                'WARNING', 'SEVERE'
+            ]
+            for line in stdout.split('\n'):
+                s = line.strip()
+                if not s:
+                    continue
+                if any(kw in s for kw in error_keywords):
+                    diagnostic.append(s)
+
+            # 检查 stderr
+            if stderr.strip():
+                for line in stderr.strip().split('\n'):
+                    s = line.strip()
+                    if s and s not in diagnostic:
+                        diagnostic.append(f"[stderr] {s}")
+
+            if diagnostic:
+                # 去重并限制行数
+                seen = set()
+                unique = []
+                for d in diagnostic:
+                    if d not in seen:
+                        seen.add(d)
+                        unique.append(d)
+                return "Script produced no output. Ghidra diagnostic:\n" + "\n".join(unique[:30])
+
+            return (
+                "No script output captured. "
+                "Ghidra headless completed (rc={}) but script produced no recognizable output. "
+                "Stderr: {}"
+            ).format(
+                result.returncode,
+                stderr.strip()[:200] if stderr.strip() else "(empty)"
+            )
 
         except subprocess.TimeoutExpired:
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
-            return "Error: Ghidra subprocess timed out (300s)"
+            return "Error: Ghidra timed out (180s)"
         except Exception as e:
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
             return f"Error: {str(e)}"
+        finally:
+            shutil.rmtree(proj_dir, ignore_errors=True)
 
     def decompile_function(self, binary_path: str, function_name: str) -> str:
         """反编译指定函数，返回伪 C 代码。"""
         print(f"[ghidra] Decompiling function: {function_name}")
-        result = self._run_in_subprocess(binary_path, "decompile", function_name)
+        result = self._run_script(binary_path, "DecompileFunc.java", function_name)
 
         if "DECOMPILED_CODE_START" in result and "DECOMPILED_CODE_END" in result:
             start = result.index("DECOMPILED_CODE_START") + len("DECOMPILED_CODE_START")
             end = result.index("DECOMPILED_CODE_END")
             code = result[start:end].strip()
-            print(f"[ghidra] Decompilation successful, got {len(code)} characters.")
+            print(f"[ghidra] Decompilation successful, {len(code)} characters.")
             return code
-        elif "ERROR:" in result:
-            return result
         else:
-            return f"Ghidra output:\n{result}"
+            # 返回完整输出（包含错误诊断）
+            print(f"[ghidra] Decompilation result: {result[:200]}...")
+            return result
 
     def get_function_calls(self, binary_path: str, function_name: str) -> str:
         """获取函数内部调用的函数列表。"""
         print(f"[ghidra] Getting function calls for: {function_name}")
-        result = self._run_in_subprocess(binary_path, "calls", function_name)
-        print(f"[ghidra] {result.strip()}")
+        result = self._run_script(binary_path, "FuncCalls.java", function_name)
+        print(f"[ghidra] {result.strip()[:200]}")
         return result
 
     def get_cross_references(self, binary_path: str, function_name: str) -> str:
         """获取调用该函数的引用。"""
         print(f"[ghidra] Getting cross references to: {function_name}")
-        result = self._run_in_subprocess(binary_path, "xrefs", function_name)
-        print(f"[ghidra] {result.strip()}")
+        result = self._run_script(binary_path, "FuncXrefs.java", function_name)
+        print(f"[ghidra] {result.strip()[:200]}")
+        return result
+
+    def vuln_scan(self, binary_path: str) -> str:
+        """运行漏洞模式扫描。"""
+        print("[ghidra] Running vulnerability pattern scan...")
+        result = self._run_script(binary_path, "VulnScan.java")
+        print(f"[ghidra] VulnScan complete, output {len(result)} chars.")
         return result
 
     def cleanup(self):
-        """清理（subprocess 方案无需额外清理）。"""
-        pass
+        """清理脚本目录。"""
+        if os.path.exists(GHIDRA_SCRIPTS_DIR):
+            shutil.rmtree(GHIDRA_SCRIPTS_DIR, ignore_errors=True)
 
-    def __del__(self):
-        pass
 
-# ==================== Agent 核心实现（无变化） ====================
+# ==================== Agent 核心实现 ====================
 class ReActAgent:
-    def __init__(self, llm_client: OpenAI, model_name: str, tools: List[Dict]):
+    def __init__(self, llm_client: OpenAI, model_name: str, tools: List[Dict],
+                 scan_context: str = ""):
         self.client = llm_client
         self.model = model_name
         self.tools = tools
         self.messages = []
         self.log_entries = []
+        self.scan_context = scan_context
         print("[*] ReAct Agent initialized.")
+        if scan_context:
+            print(f"[*] VulnScan context loaded ({len(scan_context)} chars).")
 
     def _build_system_prompt(self) -> str:
-        return """你是一个使用 ReAct 模式工作的静态分析安全专家。目标是通过调用提供的工具，分析二进制文件 'challenge'，最终找出安全漏洞。
+        prompt = (
+            "你是一个使用 ReAct 模式工作的静态分析安全专家。\n"
+            "目标是通过调用提供的工具，分析二进制文件 'challenge'，最终找出安全漏洞。\n"
+            "\n"
+            "## 重要：Ghidra 函数命名\n"
+            "该二进制文件已 strip，Ghidra 会自动将函数命名为 ENTRYADDR 格式（如 FUN_00401264）。\n"
+            "调用 Ghidra 工具时必须使用 Ghidra 的函数名，不能使用 'main' 等猜测名。\n"
+            "如果 VulnScan 输出中列出了函数名，请直接使用那些名字。\n"
+            "\n"
+            "## 可用工具\n"
+            "### radare2 工具\n"
+            "- r2_get_functions_info: 获取所有函数列表\n"
+            "- r2_disassemble_function: 反汇编指定函数（参数: function_name）\n"
+            "- r2_decompile_function: 获取伪 C 代码（参数: function_name）\n"
+            "- r2_search_strings: 搜索字符串（参数: keyword，可选）\n"
+            "- r2_get_imports: 获取导入函数列表\n"
+            "- r2_get_xrefs_to: 获取地址的交叉引用（参数: address）\n"
+            "\n"
+            "### Ghidra 工具（更精确）\n"
+            "- ghidra_decompile_function: 反编译函数为高质量伪代码（参数: function_name）\n"
+            "- ghidra_get_function_calls: 获取函数内部调用关系（参数: function_name）\n"
+            "- ghidra_get_cross_references: 获取谁调用了该函数（参数: function_name）\n"
+            "- ghidra_vuln_scan: 自动扫描危险函数调用模式（无参数）\n"
+            "\n"
+            "## 分析方法论\n"
+            "1. 先查看 VulnScan 预扫描结果（如有），识别可疑的危险函数调用点\n"
+            "2. 对每个可疑点，用 Ghidra 或 radare2 反编译上下文函数，理解数据流\n"
+            "3. 追踪数据流路径：不可信输入源 → 中间处理/检查 → 危险汇聚点\n"
+            "4. 评估边界检查是否充分：检查的上界是否大于目标缓冲区大小\n"
+            "\n"
+            "## 输出 Final Answer 前的必要证据\n"
+            "在输出最终结论前，你必须在 Thought 中明确列出以下四类证据：\n"
+            "1. **数据源**：哪个函数/地址读入不可信数据，读入到哪个缓冲区，缓冲区大小\n"
+            "2. **危险汇聚点**：哪个函数/地址执行危险操作（如 strcpy），目标缓冲区大小\n"
+            "3. **不充分的检查**：存在什么边界检查，检查的阈值是多少，为什么不能防止溢出\n"
+            "4. **关键指令地址**：至少给出读入操作和危险操作的指令地址\n"
+            "\n"
+            "只有四类证据全部具备时，才能输出确定的漏洞结论。否则输出 vuln_type 为 \"unknown\"。\n"
+            "\n"
+            "## Final Answer JSON 格式\n"
+            "当有足够证据时，输出：\n"
+            "{\n"
+            "    \"vuln_type\": \"漏洞类型\",\n"
+            "    \"location\": \"函数名或地址\",\n"
+            "    \"cause\": \"描述不可信输入如何到达危险操作，以及检查为何不充分\"\n"
+            "}\n"
+            "\n"
+            "## 注意\n"
+            "- 每次只能调用一个工具\n"
+            "- Observation 只能来自工具返回\n"
+            "- 不要编造信息\n"
+            "- 如果某个工具返回了 Ghidra diagnostic 信息，请阅读并理解错误原因\n"
+            "- 分析完成后必须输出 Final Answer JSON\n"
+        )
 
-## 可用工具
-### radare2 工具
-- r2_get_functions_info: 获取所有函数列表
-- r2_disassemble_function: 反汇编指定函数（参数: function_name）
-- r2_decompile_function: 获取伪 C 代码（参数: function_name）
-- r2_search_strings: 搜索字符串（参数: keyword，可选）
-- r2_get_imports: 获取导入函数列表
-- r2_get_xrefs_to: 获取地址的交叉引用（参数: address）
+        if self.scan_context:
+            prompt += (
+                "\n## VulnScan 预扫描结果（自动分析，已包含危险调用点及上下文指令）\n"
+                "以下是自动扫描发现的危险函数调用，请重点分析这些位置：\n"
+                "```\n"
+                f"{self.scan_context}\n"
+                "```\n"
+                "\n"
+                "请根据以上扫描结果，优先对 [INPUT] 标记的调用点追踪数据流到 [SINK] 标记的调用点，\n"
+                "检查中间的长度/边界检查是否能有效防止溢出。\n"
+                "注意使用 Ghidra 的函数名（如 FUN_00401264）调用其他 Ghidra 工具。\n"
+            )
 
-### Ghidra 工具（更精确）
-- ghidra_decompile_function: 反编译函数为高质量伪代码（参数: function_name）
-- ghidra_get_function_calls: 获取函数内部调用关系（参数: function_name）
-- ghidra_get_cross_references: 获取谁调用了该函数（参数: function_name）
-
-## 分析指导
-1. 先用 radare2 获取基本信息（函数、导入、字符串）
-2. 关注危险函数: gets, strcpy, sprintf, system, malloc/free 配对等
-3. 使用 Ghidra 反编译可疑函数，分析数据流
-4. 当有足够证据时，输出 Final Answer JSON，格式：
-{
-    "vuln_type": "漏洞类型（如 stack_buffer_overflow, use_after_free, format_string 等）",
-    "location": "函数名或地址",
-    "cause": "不可信输入如何到达危险操作的一两句话"
-}
-如果没有发现漏洞，输出 vuln_type 为 "none"。
-
-## 注意
-- 每次只能调用一个工具
-- Observation 只能来自工具返回
-- 不要编造信息
-- 分析完成后必须输出 Final Answer JSON
-"""
+        return prompt
 
     def _execute_tool(self, tool_name: str, args: Dict) -> str:
         global r2_tool, ghidra_tool
@@ -424,6 +764,8 @@ class ReActAgent:
                 return ghidra_tool.get_function_calls(TARGET_FILE, args.get("function_name"))
             elif tool_name == "ghidra_get_cross_references":
                 return ghidra_tool.get_cross_references(TARGET_FILE, args.get("function_name"))
+            elif tool_name == "ghidra_vuln_scan":
+                return ghidra_tool.vuln_scan(TARGET_FILE)
             else:
                 return f"Unknown tool: {tool_name}"
         except Exception as e:
@@ -456,7 +798,7 @@ class ReActAgent:
                 message = response.choices[0].message
 
                 if message.content:
-                    preview = message.content[:200] + "..." if len(message.content) > 200 else message.content
+                    preview = message.content[:300] + "..." if len(message.content) > 300 else message.content
                     print(f"[Thought] {preview}")
                     self.log_entries.append(f"Thought: {message.content}\n")
                 else:
@@ -498,40 +840,160 @@ class ReActAgent:
                 error_msg = f"LLM error: {str(e)}"
                 print(f"[Error] {error_msg}")
                 self.log_entries.append(error_msg)
-                return json.dumps({"vuln_type": "analysis_error", "location": "unknown", "cause": error_msg})
+                return json.dumps({
+                    "vuln_type": "analysis_error",
+                    "location": "unknown",
+                    "cause": error_msg
+                })
 
         print("[Agent] Max iterations reached without Final Answer.")
-        return json.dumps({"vuln_type": "not_found", "location": "unknown", "cause": "Maximum iterations reached"})
+        return json.dumps({
+            "vuln_type": "not_found",
+            "location": "unknown",
+            "cause": "Maximum iterations reached"
+        })
 
     def save_log(self, log_path: str):
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, 'w', encoding='utf-8') as f:
-            f.write(f"ReAct Agent Analysis Log\nStarted at: {datetime.now().isoformat()}\n")
-            f.write(f"Target: {TARGET_FILE}\nModel: {MODEL_NAME}\n\n{'-'*80}\n\n")
+            f.write(f"ReAct Agent Analysis Log\n")
+            f.write(f"Started at: {datetime.now().isoformat()}\n")
+            f.write(f"Target: {TARGET_FILE}\n")
+            f.write(f"Model: {MODEL_NAME}\n")
+            f.write(f"\n{'-'*80}\n\n")
+            if self.scan_context:
+                f.write("=== VulnScan Pre-scan Context ===\n")
+                f.write(self.scan_context)
+                f.write(f"\n{'-'*80}\n\n")
             f.writelines(self.log_entries)
         print(f"[Log] Saved to {log_path}")
 
 
-# ==================== 工具 Schema（无变化） ====================
+# ==================== 定义 LLM 工具 Schema ====================
 TOOLS = [
-    {"type": "function", "function": {"name": "r2_get_functions_info", "description": "获取所有函数列表", "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {"name": "r2_disassemble_function", "description": "反汇编指定函数", "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}}},
-    {"type": "function", "function": {"name": "r2_decompile_function", "description": "使用 radare2 获取伪 C 代码", "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}}},
-    {"type": "function", "function": {"name": "r2_search_strings", "description": "搜索字符串", "parameters": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": []}}},
-    {"type": "function", "function": {"name": "r2_get_imports", "description": "获取导入函数", "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {"name": "r2_get_xrefs_to", "description": "获取地址的交叉引用", "parameters": {"type": "object", "properties": {"address": {"type": "string"}}, "required": ["address"]}}},
-    {"type": "function", "function": {"name": "ghidra_decompile_function", "description": "使用 Ghidra 反编译函数，返回高质量伪代码", "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}}},
-    {"type": "function", "function": {"name": "ghidra_get_function_calls", "description": "获取函数内部调用的函数列表", "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}}},
-    {"type": "function", "function": {"name": "ghidra_get_cross_references", "description": "获取调用该函数的引用", "parameters": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}}}
+    {
+        "type": "function",
+        "function": {
+            "name": "r2_get_functions_info",
+            "description": "获取所有函数列表",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "r2_disassemble_function",
+            "description": "反汇编指定函数",
+            "parameters": {
+                "type": "object",
+                "properties": {"function_name": {"type": "string"}},
+                "required": ["function_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "r2_decompile_function",
+            "description": "使用 radare2 获取伪 C 代码",
+            "parameters": {
+                "type": "object",
+                "properties": {"function_name": {"type": "string"}},
+                "required": ["function_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "r2_search_strings",
+            "description": "搜索字符串",
+            "parameters": {
+                "type": "object",
+                "properties": {"keyword": {"type": "string"}},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "r2_get_imports",
+            "description": "获取导入函数",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "r2_get_xrefs_to",
+            "description": "获取地址的交叉引用",
+            "parameters": {
+                "type": "object",
+                "properties": {"address": {"type": "string"}},
+                "required": ["address"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ghidra_decompile_function",
+            "description": "使用 Ghidra 反编译函数，返回高质量伪代码",
+            "parameters": {
+                "type": "object",
+                "properties": {"function_name": {"type": "string"}},
+                "required": ["function_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ghidra_get_function_calls",
+            "description": "获取函数内部调用的函数列表",
+            "parameters": {
+                "type": "object",
+                "properties": {"function_name": {"type": "string"}},
+                "required": ["function_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ghidra_get_cross_references",
+            "description": "获取调用该函数的引用",
+            "parameters": {
+                "type": "object",
+                "properties": {"function_name": {"type": "string"}},
+                "required": ["function_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ghidra_vuln_scan",
+            "description": (
+                "自动扫描二进制文件中所有危险函数调用（如 fgets/strcpy/system 等），"
+                "输出每个调用点的函数名、地址及前后上下文指令。"
+                "用于快速定位潜在漏洞位置。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    }
 ]
 
-# ==================== 全局实例 ====================
+# ==================== 全局工具实例 ====================
 r2_tool = None
 ghidra_tool = None
 
 
 # ==================== 主函数 ====================
 def main():
+    global r2_tool, ghidra_tool  # <-- 修复：声明为全局变量
+
     if not os.path.exists(TARGET_FILE):
         print(f"Error: Target file not found at {TARGET_FILE}")
         sys.exit(1)
@@ -543,20 +1005,58 @@ def main():
     print(f"Target: {TARGET_FILE}")
     print(f"Model: {MODEL_NAME}")
 
-    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-    agent = ReActAgent(client, MODEL_NAME, TOOLS)
+    # ==================== 第一阶段：VulnScan 预扫描 ====================
+    print(f"\n{'='*60}")
+    print("Phase 1: Pre-scan with VulnScan")
+    print(f"{'='*60}")
 
-    final_answer = agent.run("请分析目标二进制文件，找出其中的安全漏洞。", max_iterations=12)
+    scan_context = ""
+    try:
+        if ghidra_tool is None:
+            ghidra_tool = GhidraTool()
+        scan_context = ghidra_tool.vuln_scan(TARGET_FILE)
+        if scan_context and not scan_context.startswith("Error") and not scan_context.startswith("No script"):
+            print(f"[Pre-scan] VulnScan completed successfully ({len(scan_context)} chars).")
+            print(f"[Pre-scan] Scan results will be injected into LLM context.")
+        else:
+            print(f"[Pre-scan] VulnScan returned no useful results, proceeding without context.")
+            if scan_context:
+                print(f"[Pre-scan] Raw output: {scan_context[:300]}")
+            scan_context = ""
+    except Exception as e:
+        print(f"[Pre-scan] VulnScan failed: {e}")
+        print(f"[Pre-scan] Proceeding without scan context.")
+        scan_context = ""
+
+    # ==================== 第二阶段：LLM 驱动的深度分析 ====================
+    print(f"\n{'='*60}")
+    print("Phase 2: LLM-driven ReAct Analysis")
+    print(f"{'='*60}")
+
+    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    agent = ReActAgent(client, MODEL_NAME, TOOLS, scan_context=scan_context)
+
+    user_prompt = "请分析目标二进制文件，找出其中的安全漏洞。"
+    if scan_context:
+        user_prompt += (
+            "\n\nVulnScan 预扫描已经发现了可疑的危险函数调用点及上下文指令（见系统提示）。"
+            "请根据扫描结果重点分析这些位置，追踪数据流并评估边界检查的充分性。"
+        )
+
+    final_answer = agent.run(user_prompt, max_iterations=12)
     agent.save_log(LOG_FILE)
 
-    if ghidra_tool:
+    # 清理 Ghidra 脚本
+    if ghidra_tool is not None:
         ghidra_tool.cleanup()
 
+    # ==================== 保存结果 ====================
     try:
         result = json.loads(final_answer)
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"\n[Result] Saved to {OUTPUT_FILE}")
+        print("[Final Answer]")
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except json.JSONDecodeError:
         match = re.search(r'\{[^{}]*\}', final_answer)
